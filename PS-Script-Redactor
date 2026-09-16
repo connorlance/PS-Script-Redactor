@@ -1,0 +1,1450 @@
+#!/usr/bin/env python3
+"""
+PowerShell Script Redactor
+==========================
+
+Single-file GUI tool. Load or paste a PowerShell script in the top box; the
+bottom box shows a redacted copy, updated automatically, with every redaction
+highlighted in red.
+
+ - VS Code "Dark+" PowerShell syntax highlighting in both boxes
+ - ~30 detectors: secrets and API keys, GUIDs labelled from context as tenant /
+   app / subscription IDs, emails, SIDs, LDAP DNs, UNC paths, SharePoint and
+   onmicrosoft domains, IPs, MACs, internal hostnames. Each one toggleable.
+ - Usernames are found by context (account-looking variables such as
+   $targetUser, and account parameters such as -SamAccountName), then that same
+   value is redacted everywhere else it appears in the script
+ - Custom company names, terms and regex patterns; an allow list for public
+   endpoints that should survive, such as graph.microsoft.com
+ - Placeholders are numbered only when a label has more than one distinct value,
+   and the same value always gets the same number
+ - Arrows next to the count jump through the redactions (also F3 / Shift-F3)
+ - Copy or export the result; settings are written back into THIS file, so it
+   stays a single portable file (falls back to a sidecar .json if the file is
+   read-only or the script has been frozen with PyInstaller)
+
+Run:  python ps_redactor.py      (requires Python 3.8+ with tkinter)
+"""
+
+import json
+import os
+import re
+import sys
+import tempfile
+from collections import Counter
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+APP_NAME = "PowerShell Redactor"
+APP_VERSION = "1.4"
+
+# ---------------------------------------------------------------------------
+# Persisted settings live in the block below. It is rewritten in place when you
+# press Save in the Settings window. Don't hand-edit unless you know JSON.
+# ---------------------------------------------------------------------------
+# <<<SETTINGS_BEGIN>>>
+EMBEDDED_SETTINGS = r'''
+{
+  "detectors": {
+    "private_key": true,
+    "cert_block": true,
+    "jwt": true,
+    "azure_secret": true,
+    "cloud_tokens": true,
+    "secret_assignment": true,
+    "secret_param": true,
+    "securestring": true,
+    "connection_string": true,
+    "thumbprint": true,
+    "base64_blob": true,
+    "hex_blob": true,
+    "sharepoint_url": true,
+    "tenant_domain": true,
+    "exchange_endpoint": true,
+    "guid": true,
+    "email": true,
+    "ldap_dn": true,
+    "sid": true,
+    "domain_user": true,
+    "user_profile_path": true,
+    "account_assignment": true,
+    "account_param": true,
+    "phone": true,
+    "unc_path": true,
+    "internal_host": true,
+    "ipv6": true,
+    "mac": true,
+    "ipv4": true,
+    "url": true,
+    "aggr_strings": false,
+    "aggr_output_text": false,
+    "aggr_any_string": false,
+    "aggr_paths": false,
+    "aggr_hostnames": false,
+    "aggr_asset_names": false,
+    "aggr_comments": false
+  },
+  "company_names": [],
+  "extra_terms": [],
+  "allowlist": [
+    "graph.microsoft.com",
+    "login.microsoftonline.com",
+    "login.windows.net",
+    "management.azure.com",
+    "outlook.office365.com",
+    "outlook.office.com",
+    "ps.outlook.com",
+    "manage.office.com",
+    "admin.microsoft.com",
+    "docs.microsoft.com",
+    "learn.microsoft.com",
+    "schemas.microsoft.com",
+    "www.microsoft.com",
+    "aka.ms",
+    "powershellgallery.com",
+    "nuget.org",
+    "github.com",
+    "githubusercontent.com",
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "255.255.255.255",
+    "::1",
+    "example.com"
+  ],
+  "custom_patterns": [],
+  "options": {
+    "number_placeholders": true,
+    "redact_private_ips": true,
+    "company_partial_match": true,
+    "propagate_learned_names": true,
+    "syntax_highlight": true
+  }
+}
+'''
+# <<<SETTINGS_END>>>
+
+# ---------------------------------------------------------------------------
+# Theme (VS Code Dark+)
+# ---------------------------------------------------------------------------
+BG          = "#1e1e1e"
+BG_PANEL    = "#252526"
+BG_INPUT    = "#1e1e1e"
+BG_BUTTON   = "#333333"
+BG_BUTTON_H = "#3f3f46"
+BG_ACCENT   = "#0e639c"
+BG_ACCENT_H = "#1177bb"
+FG          = "#d4d4d4"
+FG_DIM      = "#858585"
+BORDER      = "#3c3c3c"
+GUTTER_BG   = "#1e1e1e"
+GUTTER_FG   = "#6e7681"
+SEL_BG      = "#264f78"
+
+SYNTAX = {
+    "comment":  "#6a9955",
+    "string":   "#ce9178",
+    "variable": "#9cdcfe",
+    "keyword":  "#569cd6",
+    "cmdlet":   "#dcdcaa",
+    "param":    "#9cdcfe",
+    "type":     "#4ec9b0",
+    "number":   "#b5cea8",
+    "operator": "#569cd6",
+}
+
+REDACT_BG = "#b3261e"
+REDACT_FG = "#ffffff"
+
+MONO = ("Consolas", 11) if sys.platform.startswith("win") else ("Menlo", 12) \
+    if sys.platform == "darwin" else ("DejaVu Sans Mono", 10)
+UI_FONT = ("Segoe UI", 9) if sys.platform.startswith("win") else ("Helvetica", 11)
+
+# ---------------------------------------------------------------------------
+# Detector definitions
+# ---------------------------------------------------------------------------
+# group : which regex capture group gets replaced (0 = whole match)
+# prio  : higher wins when two detectors overlap
+
+DETECTOR_SPECS = [
+    # --- Secrets & keys -----------------------------------------------------
+    dict(key="private_key", cat="Secrets & keys", prio=100,
+         label="Private key blocks (-----BEGIN PRIVATE KEY-----)",
+         placeholder="PRIVATE KEY",
+         pattern=r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----"),
+    dict(key="cert_block", cat="Secrets & keys", prio=100,
+         label="Certificate blocks (-----BEGIN CERTIFICATE-----)",
+         placeholder="CERTIFICATE",
+         pattern=r"-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----"),
+    dict(key="jwt", cat="Secrets & keys", prio=96,
+         label="JWT / bearer tokens (eyJ...)",
+         placeholder="JWT TOKEN",
+         pattern=r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{6,}"),
+    dict(key="azure_secret", cat="Secrets & keys", prio=95,
+         label="Azure AD / Entra client secrets",
+         placeholder="CLIENT SECRET",
+         pattern=r"\b[A-Za-z0-9._~\-]{3}[0-9]Q~[A-Za-z0-9._~\-]{28,45}\b"),
+    dict(key="cloud_tokens", cat="Secrets & keys", prio=95,
+         label="Known API key formats (AWS, GitHub, Slack, Stripe, Google, OpenAI, GitLab, npm)",
+         placeholder="API KEY",
+         pattern=(r"\b(?:(?:AKIA|ASIA|AIDA|AROA|ANPA|ANVA|AGPA)[A-Z0-9]{16}"
+                  r"|gh[pousr]_[A-Za-z0-9]{20,}"
+                  r"|xox[abprs]-[A-Za-z0-9\-]{10,}"
+                  r"|(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{10,}"
+                  r"|AIza[0-9A-Za-z_\-]{35}"
+                  r"|sk-[A-Za-z0-9\-_]{20,}"
+                  r"|glpat-[A-Za-z0-9_\-]{18,}"
+                  r"|npm_[A-Za-z0-9]{30,})")),
+    dict(key="secret_assignment", cat="Secrets & keys", prio=92, group=2,
+         label="Quoted values assigned to secret-looking variables ($apiKey = \"...\")",
+         placeholder="SECRET",
+         pattern=(r"(?i)\$(?:env:)?[\w:]*"
+                  r"(?:password|passwd|pwd|secret|apikey|api_key|token|cred|"
+                  r"clientsecret|accesskey|sharedkey|connectionstring|sas)[\w]*"
+                  r"\s*=\s*(['\"])([^'\"\r\n]{1,400})\1")),
+    dict(key="secret_param", cat="Secrets & keys", prio=92, group=2,
+         label="Quoted values passed to secret parameters (-Password '...', -ClientSecret '...')",
+         placeholder="SECRET",
+         pattern=(r"(?i)-(?:Password|ClientSecret|Secret|SecretKey|ApiKey|Token|"
+                  r"AccessKey|SharedKey|SasToken|Credential)\s+(['\"])([^'\"\r\n]{1,400})\1")),
+    dict(key="securestring", cat="Secrets & keys", prio=92, group=2,
+         label="ConvertTo-SecureString plain text values",
+         placeholder="SECRET",
+         pattern=r"(?i)ConvertTo-SecureString\s+(?:-String\s+)?(['\"])([^'\"\r\n]{1,400})\1"),
+    dict(key="connection_string", cat="Secrets & keys", prio=90,
+         label="Connection strings (Server=...;Database=...;)",
+         placeholder="CONNECTION STRING",
+         pattern=(r"(?i)\b(?:Server|Data Source|Initial Catalog|Database|User ID|"
+                  r"AccountName|AccountKey|DefaultEndpointsProtocol|Endpoint)\s*=\s*"
+                  r"[^;\r\n\"']{1,150}(?:;\s*[A-Za-z ]{2,30}\s*=\s*[^;\r\n\"']{0,200}){1,};?")),
+    dict(key="thumbprint", cat="Secrets & keys", prio=74,
+         label="Certificate thumbprints (40 hex chars)",
+         placeholder="CERT THUMBPRINT",
+         pattern=r"\b[0-9A-Fa-f]{40}\b"),
+    dict(key="base64_blob", cat="Secrets & keys", prio=35,
+         label="Long base64 blobs (40+ chars) — noisy, uncheck if it over-matches",
+         placeholder="ENCODED DATA",
+         pattern=r"\b[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])"),
+    dict(key="hex_blob", cat="Secrets & keys", prio=34,
+         label="Long hex strings (32+ chars) — noisy, uncheck if it over-matches",
+         placeholder="HEX STRING",
+         pattern=r"\b[0-9A-Fa-f]{32,}\b"),
+
+    # --- Microsoft 365 / Azure ---------------------------------------------
+    dict(key="sharepoint_url", cat="Microsoft 365 / Azure", prio=88,
+         label="SharePoint Online / OneDrive URLs (*.sharepoint.com)",
+         placeholder="SHAREPOINT URL",
+         pattern=(r"(?i)\b(?:https?://)?[A-Za-z0-9\-]{1,63}(?:-my|-admin)?"
+                  r"\.sharepoint\.com(?:/[^\s\"'<>)\]},;]*)?")),
+    dict(key="tenant_domain", cat="Microsoft 365 / Azure", prio=86,
+         label="Tenant domains (*.onmicrosoft.com)",
+         placeholder="TENANT DOMAIN",
+         pattern=r"(?i)\b[A-Za-z0-9\-]{1,63}\.onmicrosoft\.com\b"),
+    dict(key="exchange_endpoint", cat="Microsoft 365 / Azure", prio=86,
+         label="Exchange Online endpoints (*.mail.protection.outlook.com)",
+         placeholder="EXCHANGE ENDPOINT",
+         pattern=r"(?i)\b[A-Za-z0-9\-]{1,63}\.mail\.protection\.outlook\.com\b"),
+    dict(key="guid", cat="Microsoft 365 / Azure", prio=76,
+         label="GUIDs — labelled from context as tenant / app / subscription / object ID",
+         placeholder="GUID",
+         pattern=r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"),
+
+    # --- Identity & accounts ------------------------------------------------
+    dict(key="email", cat="Identity & accounts", prio=89,
+         label="Email addresses / UPNs",
+         placeholder="EMAIL ADDRESS",
+         pattern=r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24}\b"),
+    dict(key="ldap_dn", cat="Identity & accounts", prio=87,
+         label="LDAP distinguished names (CN=...,OU=...,DC=...)",
+         placeholder="DISTINGUISHED NAME",
+         pattern=(r"(?i)\b(?:CN|OU|DC)=[^,\r\n\"']{1,64}"
+                  r"(?:\s*,\s*(?:CN|OU|DC|O|L|ST|C|UID)=[^,\r\n\"']{1,64})+")),
+    dict(key="sid", cat="Identity & accounts", prio=85,
+         label="Windows SIDs (S-1-5-21-...)",
+         placeholder="SID",
+         pattern=r"\bS-1-\d{1,2}(?:-\d{1,12}){1,15}\b"),
+    dict(key="domain_user", cat="Identity & accounts", prio=84,
+         label="DOMAIN\\username credentials",
+         placeholder="DOMAIN USER",
+         pattern=r"(?<![\w\\/])[A-Za-z][A-Za-z0-9._\-]{1,30}\\[A-Za-z0-9._$\-]{1,64}(?![\w\\])"),
+    dict(key="user_profile_path", cat="Identity & accounts", prio=85,
+         label="User profile paths (C:\\Users\\jsmith)",
+         placeholder="USER PROFILE PATH",
+         pattern=r"(?i)[A-Za-z]:\\Users\\[^\\\s\"'<>|:*?\r\n]+"),
+    dict(key="account_assignment", cat="Identity & accounts", prio=79,
+         label="Quoted values assigned to account-looking variables ($targetUser = \"clance\")",
+         placeholder="USERNAME",
+         pattern=(r"(?i)\$(?:env:)?[\w:]*"
+                  r"(?:user|account|upn|samaccountname|identity|mailbox|owner|"
+                  r"manager|member|admin|employee|person|alias|displayname|"
+                  r"login|logon|recipient)[\w]*"
+                  r"\s*=\s*(?:@\(\s*)?(?:['\"][^'\"\r\n]{1,256}['\"]\s*,?\s*)+\)?"),
+         sub_pattern=r"['\"]([^'\"\r\n]{1,256})['\"]"),
+    dict(key="account_param", cat="Identity & accounts", prio=79,
+         label="Quoted values passed to account parameters (-Identity, -SamAccountName, -Mailbox ...)",
+         placeholder="USERNAME",
+         pattern=(r"(?i)-(?:Identity|UserPrincipalName|SamAccountName|UserId|User|"
+                  r"Mailbox|Owner|Manager|Members|Member|MemberOf|GroupName|"
+                  r"DisplayName|GivenName|Surname|EmailAddress|PrimarySmtpAddress|"
+                  r"Alias|AccountName|LogonName|Recipient|Delegate|TargetUser)"
+                  r"\s+(?:@\(\s*)?(?:['\"][^'\"\r\n]{1,256}['\"]\s*,?\s*)+\)?"),
+         sub_pattern=r"['\"]([^'\"\r\n]{1,256})['\"]"),
+    dict(key="phone", cat="Identity & accounts", prio=30,
+         label="Phone numbers — noisy, uncheck if it over-matches",
+         placeholder="PHONE NUMBER",
+         pattern=(r"(?<![\w.])(?:\+\d{1,3}[ .\-]?)?(?:\(\d{2,4}\)|\d{2,4})"
+                  r"[ .\-]\d{3,4}[ .\-]?\d{3,4}(?![\w.])")),
+
+    # --- Network & infrastructure ------------------------------------------
+    dict(key="unc_path", cat="Network & infrastructure", prio=85,
+         label="UNC paths (\\\\server\\share)",
+         placeholder="UNC PATH",
+         pattern=r"\\\\[A-Za-z0-9._\-]{2,}(?:\\[^\s\"'<>|:*?\r\n]+)*"),
+    dict(key="internal_host", cat="Network & infrastructure", prio=87,
+         label="Internal hostnames (*.local, *.corp, *.internal, *.lan, *.ad ...)",
+         placeholder="INTERNAL HOSTNAME",
+         pattern=(r"(?i)(?<![\w.$])(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+"
+                  r"(?:local|lan|corp|internal|intranet|priv|private|ad|dmz)\b")),
+    dict(key="ipv6", cat="Network & infrastructure", prio=62,
+         label="IPv6 addresses",
+         placeholder="IPV6 ADDRESS",
+         pattern=(r"(?<![\w:.])(?:"
+                  r"(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}"
+                  r"|(?:[A-Fa-f0-9]{1,4}:){1,7}:"
+                  r"|(?:[A-Fa-f0-9]{1,4}:){1,6}(?::[A-Fa-f0-9]{1,4}){1,1}"
+                  r"|(?:[A-Fa-f0-9]{1,4}:){1,5}(?::[A-Fa-f0-9]{1,4}){1,2}"
+                  r"|(?:[A-Fa-f0-9]{1,4}:){1,4}(?::[A-Fa-f0-9]{1,4}){1,3}"
+                  r"|(?:[A-Fa-f0-9]{1,4}:){1,3}(?::[A-Fa-f0-9]{1,4}){1,4}"
+                  r"|(?:[A-Fa-f0-9]{1,4}:){1,2}(?::[A-Fa-f0-9]{1,4}){1,5}"
+                  r"|[A-Fa-f0-9]{1,4}:(?::[A-Fa-f0-9]{1,4}){1,6}"
+                  r"|:(?::[A-Fa-f0-9]{1,4}){1,7}"
+                  r"|(?:[A-Fa-f0-9]{1,4}:){3,7}[A-Fa-f0-9]{1,4}"
+                  r")(?![\w:.])")),
+    dict(key="mac", cat="Network & infrastructure", prio=68,
+         label="MAC addresses",
+         placeholder="MAC ADDRESS",
+         pattern=r"\b(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b"),
+    dict(key="ipv4", cat="Network & infrastructure", prio=60,
+         label="IPv4 addresses",
+         placeholder="IP ADDRESS",
+         pattern=r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])"),
+    dict(key="url", cat="Network & infrastructure", prio=40,
+         label="URLs (allow-listed public URLs are kept)",
+         placeholder="URL",
+         pattern=r"(?i)\bhttps?://[^\s\"'<>)\]},;]+"),
+
+    # --- Scrub everything (off by default) ---------------------------------
+    dict(key="aggr_strings", cat="Scrub everything (off by default)", prio=91,
+         default=False, group=2,
+         label="Every quoted value assigned to any variable",
+         placeholder="STRING",
+         pattern=r"""(?i)\$[\w:]+\s*=\s*(['\"])([^'\"\r\n]{1,400})\1"""),
+    dict(key="aggr_output_text", cat="Scrub everything (off by default)", prio=91,
+         default=False,
+         label="Quoted text given to Write-Host, Read-Host, Write-Output, logging etc.",
+         placeholder="TEXT",
+         pattern=(r"(?i)\b(?:Write-Host|Write-Output|Write-Verbose|Write-Warning|"
+                  r"Write-Error|Write-Information|Write-Debug|Write-Progress|"
+                  r"Read-Host|Out-File|Add-Content|Set-Content|Out-Host|"
+                  r"Send-MailMessage|Show-Message|Throw|Echo)\b[^\r\n]*"),
+         sub_pattern=r"""['\"]([^'\"\r\n]{1,400})['\"]"""),
+    dict(key="aggr_any_string", cat="Scrub everything (off by default)", prio=90,
+         default=False,
+         label="Every quoted string anywhere, single or double quoted",
+         placeholder="STRING",
+         pattern=r"""\"(?:[^\"`\r\n]|`.)*\"|'(?:[^'\r\n]|'')*'"""),
+    dict(key="aggr_paths", cat="Scrub everything (off by default)", prio=86,
+         default=False,
+         label="Any file or folder path (C:\\..., .\\logs\\out.csv)",
+         placeholder="PATH",
+         pattern=(r"(?i)(?<![\w])[a-z]:\\[^\s\"'<>|*?\r\n]*"
+                  r"|(?<![\w])\.{1,2}\\[^\s\"'<>|*?\r\n]+")),
+    dict(key="aggr_hostnames", cat="Scrub everything (off by default)", prio=45,
+         default=False,
+         label="Anything dotted that looks like a hostname, whatever the suffix",
+         placeholder="HOSTNAME",
+         pattern=(r"(?<![\w.$])[A-Za-z][A-Za-z0-9\-]{1,62}"
+                  r"(?:\.[A-Za-z0-9][A-Za-z0-9\-]{0,62}){1,}(?![\w.])")),
+    dict(key="aggr_asset_names", cat="Scrub everything (off by default)", prio=44,
+         default=False,
+         label="Server / asset style names: caps and digits, e.g. PRDSQL04, DC01",
+         placeholder="ASSET NAME",
+         pattern=r"(?<![\w-])(?=[A-Z0-9\-]{3,24}(?![\w-]))(?=[A-Z\-]*\d)[A-Z0-9\-]+(?![\w-])"),
+    dict(key="aggr_comments", cat="Scrub everything (off by default)", prio=99,
+         default=False,
+         label="Whole comments, including block comments",
+         placeholder="COMMENT",
+         pattern=r"<\#[\s\S]*?\#>|\#[^\r\n]*"),
+]
+
+DETECTOR_KEYS = [d["key"] for d in DETECTOR_SPECS]
+CATEGORY_ORDER = ["Secrets & keys", "Microsoft 365 / Azure",
+                  "Identity & accounts", "Network & infrastructure",
+                  "Scrub everything (off by default)"]
+DETECTOR_DEFAULTS = {d["key"]: d.get("default", True) for d in DETECTOR_SPECS}
+
+# Substring match. Keep these specific: a broad entry like "microsoft.com" would
+# also allow-list yourtenant.onmicrosoft.com, and "windows.net" would allow-list
+# yourstorageaccount.blob.core.windows.net.
+DEFAULT_ALLOWLIST = [
+    "graph.microsoft.com", "login.microsoftonline.com", "login.windows.net",
+    "management.azure.com", "outlook.office365.com", "outlook.office.com",
+    "ps.outlook.com", "manage.office.com", "admin.microsoft.com",
+    "docs.microsoft.com", "learn.microsoft.com", "schemas.microsoft.com",
+    "www.microsoft.com", "aka.ms", "powershellgallery.com", "nuget.org",
+    "github.com", "githubusercontent.com",
+    "localhost", "127.0.0.1", "0.0.0.0", "255.255.255.255", "::1",
+    "example.com",
+]
+
+DEFAULT_SETTINGS = {
+    "detectors": dict(DETECTOR_DEFAULTS),
+    "company_names": [],
+    "extra_terms": [],
+    "allowlist": list(DEFAULT_ALLOWLIST),
+    "custom_patterns": [],          # [{"label": "EMPLOYEE ID", "pattern": "EMP\\d{6}"}]
+    "options": {
+        "number_placeholders": True,     # only when a label has >1 distinct value
+        "redact_private_ips": True,      # 10.x, 192.168.x, 172.16-31.x
+        "company_partial_match": False,  # match company name inside longer words
+        "propagate_learned_names": True, # redact learned usernames everywhere else
+        "syntax_highlight": True,
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Settings load / save (written back into this file)
+# ---------------------------------------------------------------------------
+def _script_path():
+    if getattr(sys, "frozen", False):
+        return None
+    try:
+        return os.path.abspath(__file__)
+    except NameError:
+        return None
+
+
+def _sidecar_path():
+    base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
+                                           else (_script_path() or sys.argv[0])))
+    return os.path.join(base, "ps_redactor.settings.json")
+
+
+def _merge(defaults, loaded):
+    out = json.loads(json.dumps(defaults))
+    if not isinstance(loaded, dict):
+        return out
+    for k, v in loaded.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k].update(v)
+        else:
+            out[k] = v
+    # detector keys added in later versions take their own default
+    for k in DETECTOR_KEYS:
+        out["detectors"].setdefault(k, DETECTOR_DEFAULTS[k])
+    return out
+
+
+def load_settings():
+    data = {}
+    side = _sidecar_path()
+    if os.path.exists(side):
+        try:
+            with open(side, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            data = {}
+    else:
+        try:
+            data = json.loads(EMBEDDED_SETTINGS.strip() or "{}")
+        except Exception:
+            data = {}
+    return _merge(DEFAULT_SETTINGS, data)
+
+
+def save_settings(cfg):
+    """Rewrite the settings block inside this very file. Returns (ok, message)."""
+    blob = json.dumps(cfg, indent=2, ensure_ascii=True).replace("'", r"\u0027")
+    path = _script_path()
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                src = fh.read()
+            pattern = re.compile(
+                r"(# <<<SETTINGS_BEGIN>>>\nEMBEDDED_SETTINGS = r'''\n)[\s\S]*?(\n'''\n# <<<SETTINGS_END>>>)")
+            if not pattern.search(src):
+                raise RuntimeError("settings block not found")
+            new_src = pattern.sub(lambda m: m.group(1) + blob + m.group(2), src, count=1)
+            folder = os.path.dirname(path)
+            fd, tmp = tempfile.mkstemp(dir=folder, suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(new_src)
+            os.replace(tmp, path)
+            return True, "Settings saved into %s" % os.path.basename(path)
+        except Exception as exc:
+            err = str(exc)
+    else:
+        err = "running frozen / no source file"
+    # fallback
+    try:
+        with open(_sidecar_path(), "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+        return True, "Saved to %s (could not write to the script: %s)" % (
+            os.path.basename(_sidecar_path()), err)
+    except Exception as exc:
+        return False, "Could not save settings: %s" % exc
+
+
+# ---------------------------------------------------------------------------
+# Redaction engine
+# ---------------------------------------------------------------------------
+def _valid_ipv4(val, cfg):
+    parts = val.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return False
+    if any(n > 255 for n in nums):
+        return False
+    if not cfg["options"].get("redact_private_ips", True):
+        if nums[0] == 10:
+            return False
+        if nums[0] == 192 and nums[1] == 168:
+            return False
+        if nums[0] == 172 and 16 <= nums[1] <= 31:
+            return False
+        if nums[0] == 127:
+            return False
+    return True
+
+
+def _not_inside_path(text, start):
+    """Reject DOMAIN\\user matches that are really part of a file path."""
+    line_start = text.rfind("\n", 0, start) + 1
+    before = text[line_start:start]
+    tail = before[-60:]
+    return (":" not in tail) and ("\\" not in tail) and ("/" not in tail)
+
+
+_GUID_CONTEXT = [
+    ("tenant", "TENANT ID"),
+    ("directoryid", "TENANT ID"),
+    ("subscription", "SUBSCRIPTION ID"),
+    ("client", "APP ID"),
+    ("appid", "APP ID"),
+    ("application", "APP ID"),
+    ("object", "OBJECT ID"),
+    ("group", "GROUP ID"),
+    ("site", "SITE ID"),
+    ("list", "LIST ID"),
+    ("user", "USER ID"),
+    ("mailbox", "MAILBOX ID"),
+]
+
+
+def _guid_label(text, start):
+    ctx = text[max(0, start - 70):start].lower().replace(" ", "").replace("_", "").replace("-", "")
+    for needle, label in _GUID_CONTEXT:
+        if needle in ctx:
+            return label
+    return "GUID"
+
+
+def _word_group(words, partial=False):
+    parts = [re.escape(w.strip()) for w in words if w.strip()]
+    if not parts:
+        return None
+    parts.sort(key=len, reverse=True)
+    body = "|".join(parts)
+    if partial:
+        return "(?i)(?:%s)" % body
+    return r"(?i)(?<![A-Za-z0-9])(?:%s)(?![A-Za-z0-9])" % body
+
+
+LEARN_KEYS = ("account_assignment", "account_param")
+LEARNABLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@\\\- ]{2,63}$")
+
+
+def build_detectors(cfg, learned=None):
+    dets = []
+    enabled = cfg.get("detectors", {})
+    for spec in DETECTOR_SPECS:
+        if not enabled.get(spec["key"], True):
+            continue
+        try:
+            rx = re.compile(spec["pattern"])
+            sub = re.compile(spec["sub_pattern"]) if spec.get("sub_pattern") else None
+        except re.error:
+            continue
+        d = dict(spec)
+        d["regex"] = rx
+        d["_sub"] = sub
+        d.setdefault("group", 0)
+        dets.append(d)
+
+    comp = _word_group(cfg.get("company_names", []),
+                       cfg["options"].get("company_partial_match", False))
+    if comp:
+        dets.append(dict(key="company", placeholder="COMPANY", prio=82, group=0,
+                         regex=re.compile(comp), _sub=None, cat="Custom"))
+
+    terms = _word_group(cfg.get("extra_terms", []),
+                        cfg["options"].get("company_partial_match", False))
+    if terms:
+        dets.append(dict(key="extra_terms", placeholder="REDACTED", prio=82, group=0,
+                         regex=re.compile(terms), _sub=None, cat="Custom"))
+
+    for item in cfg.get("custom_patterns", []):
+        pat = (item.get("pattern") or "").strip()
+        lab = (item.get("label") or "REDACTED").strip().upper()
+        if not pat:
+            continue
+        try:
+            rx = re.compile(pat)
+        except re.error:
+            continue
+        dets.append(dict(key="custom:" + lab, placeholder=lab, prio=97, group=0,
+                         regex=rx, _sub=None, cat="Custom"))
+
+    if learned:
+        grp = _word_group(sorted(learned)[:200], False)
+        if grp:
+            dets.append(dict(key="learned_name", placeholder="USERNAME", prio=83,
+                             group=0, regex=re.compile(grp), _sub=None, cat="Custom"))
+    return dets
+
+
+_ALLOW_BEFORE = ("", ".", "/", "@", "\\", " ", "\"", "'", "=", "(", "[")
+_ALLOW_AFTER = ("", "/", ":", " ", "\"", "'", ")", "]", ",", ";", "?", "#")
+
+
+def _allowed(val, allow):
+    """True if val is an allow-listed endpoint. Matches on token boundaries, so
+    an entry like ::1 does not allow-list fe80::1ff:fe23:4567:890a."""
+    low = val.lower()
+    for a in allow:
+        if not a:
+            continue
+        if low == a:
+            return True
+        idx = 0
+        while True:
+            i = low.find(a, idx)
+            if i < 0:
+                break
+            before = low[i - 1] if i else ""
+            after = low[i + len(a):i + len(a) + 1]
+            if before in _ALLOW_BEFORE and after in _ALLOW_AFTER:
+                return True
+            idx = i + 1
+    return False
+
+
+def _collect(text, cfg, dets, allow):
+    found = []
+    for d in dets:
+        grp = d.get("group", 0)
+        try:
+            iterator = list(d["regex"].finditer(text))
+        except Exception:
+            continue
+        for m in iterator:
+            spans = []
+            if d.get("_sub") is not None:
+                base = m.start()
+                for sm in d["_sub"].finditer(m.group(0)):
+                    spans.append((base + sm.start(1), base + sm.end(1)))
+            else:
+                try:
+                    spans = [m.span(grp)]
+                except Exception:
+                    continue
+            for s, e in spans:
+                if s < 0 or e <= s:
+                    continue
+                val = text[s:e]
+                if not val.strip() or val.strip().startswith("$"):
+                    continue
+                # the allow list protects public endpoints; it never overrides your
+                # own company names / terms / custom patterns
+                if d["key"] not in ("company", "extra_terms", "learned_name") and \
+                        not d["key"].startswith("custom:") and \
+                        _allowed(val, allow):
+                    continue
+                if d["key"] == "ipv4" and not _valid_ipv4(val, cfg):
+                    continue
+                if d["key"] == "domain_user" and not _not_inside_path(text, s):
+                    continue
+                label = _guid_label(text, s) if d["key"] == "guid" else d["placeholder"]
+                found.append((s, e, label, val, d["prio"], d["key"]))
+    return found
+
+
+def _resolve(found):
+    found.sort(key=lambda t: (-t[4], -(t[1] - t[0]), t[0]))
+    accepted = []
+    for s, e, label, val, prio, key in found:
+        if any(not (e <= a_s or s >= a_e) for a_s, a_e, _, _, _ in accepted):
+            continue
+        accepted.append((s, e, label, val, key))
+    accepted.sort(key=lambda t: t[0])
+    return accepted
+
+
+def redact(text, cfg):
+    """Return (segments, counts). segments = list of ('text'|'redact', string)."""
+    if not text:
+        return [], Counter()
+
+    allow = [a.strip().lower() for a in cfg.get("allowlist", []) if a.strip()]
+    dets = build_detectors(cfg)
+    accepted = _resolve(_collect(text, cfg, dets, allow))
+
+    # second pass: a name found in an account context is redacted everywhere else
+    if cfg["options"].get("propagate_learned_names", True):
+        learned = set()
+        for _, _, label, val, key in accepted:
+            if key in LEARN_KEYS and LEARNABLE_RE.match(val.strip()):
+                learned.add(val.strip())
+        if learned:
+            dets = build_detectors(cfg, learned=learned)
+            accepted = _resolve(_collect(text, cfg, dets, allow))
+
+    number = cfg["options"].get("number_placeholders", True)
+
+    # a label is only numbered when the script contains more than one distinct
+    # value for it: one email is <EMAIL ADDRESS>, three are <EMAIL ADDRESS 1..3>
+    order = {}
+    for _, _, label, val, _ in accepted:
+        vals = order.setdefault(label, [])
+        v = val.strip().lower()
+        if v not in vals:
+            vals.append(v)
+
+    counts = Counter()
+    segments = []
+    cursor = 0
+    for s, e, label, val, key in accepted:
+        if s > cursor:
+            segments.append(("text", text[cursor:s]))
+        if number and len(order[label]) > 1:
+            token = "<%s %d>" % (label, order[label].index(val.strip().lower()) + 1)
+        else:
+            token = "<%s>" % label
+        segments.append(("redact", token))
+        counts[label] += 1
+        cursor = e
+    if cursor < len(text):
+        segments.append(("text", text[cursor:]))
+    return segments, counts
+
+
+# ---------------------------------------------------------------------------
+# PowerShell syntax highlighting
+# ---------------------------------------------------------------------------
+PS_KEYWORDS = (
+    "begin|break|catch|class|continue|data|define|do|dynamicparam|else|elseif|end|"
+    "enum|exit|filter|finally|for|foreach|from|function|hidden|if|in|inlinescript|"
+    "param|process|return|static|switch|throw|trap|try|until|using|var|while|"
+    "workflow|parallel|sequence|true|false|null"
+)
+PS_OPERATORS = (
+    "eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|contains|notcontains|in|notin|"
+    "replace|split|join|is|isnot|as|and|or|xor|not|band|bor|bnot|bxor|shl|shr|f"
+)
+
+PS_TOKEN_RE = re.compile(
+    r"(?P<block_comment><\#[\s\S]*?\#>)"
+    r"|(?P<comment>\#[^\r\n]*)"
+    r"|(?P<herestring>@(?P<hq>[\"'])[\s\S]*?(?P=hq)@)"
+    r"|(?P<dstring>\"(?:[^\"`]|`[\s\S])*\")"
+    r"|(?P<sstring>'(?:[^']|'')*')"
+    r"|(?P<type>\[[A-Za-z_][\w.]*(?:\[\])?\])"
+    r"|(?P<variable>\$(?:\{[^}\r\n]*\}|[\w:]+))"
+    r"|(?P<operator>(?i:-(?:" + PS_OPERATORS + r")\b))"
+    r"|(?P<cmdlet>\b[A-Za-z]{2,}-[A-Za-z][A-Za-z0-9]*\b)"
+    r"|(?P<param>(?<![\w\-])-[A-Za-z][A-Za-z0-9]*\b)"
+    r"|(?P<keyword>(?i:\b(?:" + PS_KEYWORDS + r")\b))"
+    r"|(?P<number>\b\d+(?:\.\d+)?\b)"
+)
+
+VAR_IN_STRING_RE = re.compile(r"\$(?:\{[^}\r\n]*\}|[\w:]+)")
+
+TOKEN_TAG = {
+    "block_comment": "comment",
+    "comment": "comment",
+    "herestring": "string",
+    "dstring": "string",
+    "sstring": "string",
+    "type": "type",
+    "variable": "variable",
+    "operator": "operator",
+    "cmdlet": "cmdlet",
+    "param": "param",
+    "keyword": "keyword",
+    "number": "number",
+}
+
+
+def tokenize_powershell(text):
+    """Yield (start_index, end_index, tag) tuples."""
+    for m in PS_TOKEN_RE.finditer(text):
+        name = m.lastgroup
+        if name == "hq":
+            continue
+        for gname in TOKEN_TAG:
+            if m.group(gname) is not None:
+                tag = TOKEN_TAG[gname]
+                s, e = m.span(gname)
+                yield (s, e, tag)
+                if gname in ("dstring", "herestring") and m.group(gname).startswith(('"', '@"')):
+                    for vm in VAR_IN_STRING_RE.finditer(text, s, e):
+                        yield (vm.start(), vm.end(), "variable")
+                break
+
+
+# ---------------------------------------------------------------------------
+# Small themed widgets
+# ---------------------------------------------------------------------------
+def make_button(parent, text, command, accent=False, width=None):
+    bg = BG_ACCENT if accent else BG_BUTTON
+    hover = BG_ACCENT_H if accent else BG_BUTTON_H
+    btn = tk.Button(parent, text=text, command=command,
+                    bg=bg, fg="#ffffff" if accent else FG,
+                    activebackground=hover, activeforeground="#ffffff",
+                    relief="flat", bd=0, padx=14, pady=6,
+                    font=UI_FONT, cursor="hand2",
+                    highlightthickness=0)
+    if width:
+        btn.configure(width=width)
+    btn.bind("<Enter>", lambda e: btn.configure(bg=hover))
+    btn.bind("<Leave>", lambda e: btn.configure(bg=bg))
+    return btn
+
+
+def make_scrollbar(parent, command):
+    return tk.Scrollbar(parent, command=command, bg=BG_PANEL, troughcolor=BG,
+                        activebackground=BG_BUTTON_H, borderwidth=0,
+                        highlightthickness=0, width=12)
+
+
+def make_check(parent, text, var, wraplength=0):
+    c = tk.Checkbutton(parent, text=text, variable=var, bg=BG_PANEL, fg=FG,
+                       selectcolor=BG, activebackground=BG_PANEL,
+                       activeforeground="#ffffff", anchor="w", justify="left",
+                       font=UI_FONT, highlightthickness=0, bd=0, padx=2)
+    if wraplength:
+        c.configure(wraplength=wraplength)
+    return c
+
+
+def make_text(parent, height=6):
+    t = tk.Text(parent, height=height, bg=BG_INPUT, fg=FG, insertbackground=FG,
+                selectbackground=SEL_BG, relief="flat", bd=0, wrap="word",
+                font=MONO, padx=8, pady=6, highlightthickness=1,
+                highlightbackground=BORDER, highlightcolor=BG_ACCENT,
+                undo=True)
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Settings window
+# ---------------------------------------------------------------------------
+class SettingsWindow(tk.Toplevel):
+    def __init__(self, master, cfg, on_save):
+        super().__init__(master)
+        self.title("Settings")
+        self.configure(bg=BG)
+        self.geometry("1000x740")
+        self.minsize(620, 380)
+        self.cfg = json.loads(json.dumps(cfg))
+        self.on_save = on_save
+        self.transient(master)
+        self.grab_set()
+
+        self.det_vars = {}
+        self.opt_vars = {}
+
+        # Footer is packed first, against the bottom edge, so the Save button can
+        # never be pushed off-screen no matter how small the window gets.
+        footer = tk.Frame(self, bg=BG_PANEL)
+        footer.pack(side="bottom", fill="x")
+        tk.Frame(self, bg=BORDER, height=1).pack(side="bottom", fill="x")
+
+        fbar = tk.Frame(footer, bg=BG_PANEL)
+        fbar.pack(fill="x", padx=14, pady=10)
+        make_button(fbar, "Restore defaults", self._restore).pack(side="left")
+        make_button(fbar, "Save settings", self._save, accent=True).pack(side="right")
+        make_button(fbar, "Cancel", self.destroy).pack(side="right", padx=8)
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(side="top", fill="both", expand=True, padx=14, pady=14)
+        body.columnconfigure(0, weight=3, uniform="col")
+        body.columnconfigure(1, weight=2, uniform="col")
+        body.rowconfigure(0, weight=1)
+
+        self._build_detector_panel(body)
+        self._build_lists_panel(body)
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._load_into_widgets(self.cfg)
+
+    # -- reusable scrollable area -------------------------------------------
+    def _make_scroller(self, parent, bg):
+        """Return (outer_frame, inner_frame). inner_frame scrolls vertically."""
+        outer = tk.Frame(parent, bg=bg)
+        canvas = tk.Canvas(outer, bg=bg, highlightthickness=0, bd=0)
+        sb = make_scrollbar(outer, canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=bg)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+
+        def wheel(event):
+            # let multi-line text boxes scroll themselves
+            if isinstance(event.widget, tk.Text):
+                return
+            if getattr(event, "num", None) in (4, 5):
+                step = -1 if event.num == 4 else 1
+            else:
+                step = -1 * (event.delta // 120 or (1 if event.delta < 0 else -1))
+            canvas.yview_scroll(step, "units")
+
+        def bind_wheel(_e=None):
+            canvas.bind_all("<MouseWheel>", wheel)
+            canvas.bind_all("<Button-4>", wheel)
+            canvas.bind_all("<Button-5>", wheel)
+
+        def unbind_wheel(_e=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        outer.bind("<Enter>", bind_wheel)
+        outer.bind("<Leave>", unbind_wheel)
+        self.bind("<Destroy>", lambda e: unbind_wheel(), add="+")
+        return outer, inner
+
+    # -- detector checkboxes -------------------------------------------------
+    def _build_detector_panel(self, parent):
+        frame = tk.Frame(parent, bg=BG_PANEL, highlightthickness=1,
+                         highlightbackground=BORDER)
+        frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+
+        head = tk.Frame(frame, bg=BG_PANEL)
+        head.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(head, text="What to look for", bg=BG_PANEL, fg=FG,
+                 font=(UI_FONT[0], UI_FONT[1] + 2, "bold")).pack(side="left")
+        tk.Label(head, text="all on except the last group", bg=BG_PANEL, fg=FG_DIM,
+                 font=UI_FONT).pack(side="left", padx=8)
+        tk.Button(head, text="none", command=lambda: self._set_all(False),
+                  bg=BG_PANEL, fg=FG_DIM, relief="flat", bd=0, font=UI_FONT,
+                  activebackground=BG_PANEL, cursor="hand2").pack(side="right")
+        tk.Button(head, text="all", command=lambda: self._set_all(True),
+                  bg=BG_PANEL, fg=FG_DIM, relief="flat", bd=0, font=UI_FONT,
+                  activebackground=BG_PANEL, cursor="hand2").pack(side="right")
+
+        outer, inner = self._make_scroller(frame, BG_PANEL)
+        outer.pack(fill="both", expand=True, padx=(10, 0), pady=(0, 10))
+
+        for cat in CATEGORY_ORDER:
+            tk.Label(inner, text=cat, bg=BG_PANEL, fg="#4ec9b0",
+                     font=(UI_FONT[0], UI_FONT[1], "bold"), anchor="w").pack(
+                fill="x", pady=(10, 2))
+            for spec in DETECTOR_SPECS:
+                if spec["cat"] != cat:
+                    continue
+                var = tk.BooleanVar(value=spec.get("default", True))
+                self.det_vars[spec["key"]] = var
+                make_check(inner, spec["label"], var, wraplength=460).pack(fill="x", pady=1)
+
+    def _set_all(self, value):
+        for v in self.det_vars.values():
+            v.set(value)
+
+    # -- company names, terms, allowlist, custom regex, options -------------
+    def _build_lists_panel(self, parent):
+        holder = tk.Frame(parent, bg=BG)
+        holder.grid(row=0, column=1, sticky="nsew")
+        outer, right = self._make_scroller(holder, BG)
+        outer.pack(fill="both", expand=True)
+
+        def section(title, hint, height):
+            box = tk.Frame(right, bg=BG_PANEL, highlightthickness=1,
+                           highlightbackground=BORDER)
+            box.pack(fill="x", pady=(0, 10))
+            tk.Label(box, text=title, bg=BG_PANEL, fg=FG,
+                     font=(UI_FONT[0], UI_FONT[1], "bold"), anchor="w").pack(
+                fill="x", padx=10, pady=(8, 0))
+            tk.Label(box, text=hint, bg=BG_PANEL, fg=FG_DIM, font=UI_FONT,
+                     anchor="w", justify="left", wraplength=320).pack(
+                fill="x", padx=10, pady=(0, 4))
+            t = make_text(box, height=height)
+            t.pack(fill="x", padx=10, pady=(0, 10))
+            return t
+
+        self.txt_company = section(
+            "Company names", "One per line. Also caught inside URLs and hostnames.", 5)
+        self.txt_terms = section(
+            "Other terms to redact", "One per line: project, server, app or group names.", 4)
+        self.txt_allow = section(
+            "Never redact (allow list)", "One per line. Substring match, e.g. graph.microsoft.com.", 4)
+        self.txt_custom = section(
+            "Custom patterns", "One per line, LABEL = regex   e.g.  EMPLOYEE ID = EMP\\d{6}", 4)
+
+        opts = tk.Frame(right, bg=BG_PANEL, highlightthickness=1, highlightbackground=BORDER)
+        opts.pack(fill="x", pady=(0, 4))
+        tk.Label(opts, text="Options", bg=BG_PANEL, fg=FG,
+                 font=(UI_FONT[0], UI_FONT[1], "bold"), anchor="w").pack(
+            fill="x", padx=10, pady=(8, 2))
+        for key, text in [
+            ("number_placeholders",
+             "Number placeholders when there is more than one value (<USERNAME 1>, <USERNAME 2>)"),
+            ("redact_private_ips", "Redact private IP ranges (10.x, 192.168.x, 172.16-31.x)"),
+            ("company_partial_match", "Match company names / terms inside longer words"),
+            ("propagate_learned_names",
+             "Once a username is found, redact that same value everywhere else in the script"),
+            ("syntax_highlight", "PowerShell syntax highlighting in both boxes"),
+        ]:
+            var = tk.BooleanVar(value=True)
+            self.opt_vars[key] = var
+            make_check(opts, text, var, wraplength=320).pack(fill="x", padx=8, pady=1)
+        tk.Frame(opts, bg=BG_PANEL, height=6).pack()
+
+    # -- load / save ---------------------------------------------------------
+    def _load_into_widgets(self, cfg):
+        for k, var in self.det_vars.items():
+            var.set(bool(cfg["detectors"].get(k, DETECTOR_DEFAULTS[k])))
+        for k, var in self.opt_vars.items():
+            var.set(bool(cfg["options"].get(k, DEFAULT_SETTINGS["options"][k])))
+        self.txt_company.delete("1.0", "end")
+        self.txt_company.insert("1.0", "\n".join(cfg.get("company_names", [])))
+        self.txt_terms.delete("1.0", "end")
+        self.txt_terms.insert("1.0", "\n".join(cfg.get("extra_terms", [])))
+        self.txt_allow.delete("1.0", "end")
+        self.txt_allow.insert("1.0", "\n".join(cfg.get("allowlist", [])))
+        self.txt_custom.delete("1.0", "end")
+        self.txt_custom.insert("1.0", "\n".join(
+            "%s = %s" % (p.get("label", "REDACTED"), p.get("pattern", ""))
+            for p in cfg.get("custom_patterns", [])))
+
+    def _restore(self):
+        if messagebox.askyesno("Restore defaults",
+                               "Reset every setting back to defaults?", parent=self):
+            self._load_into_widgets(json.loads(json.dumps(DEFAULT_SETTINGS)))
+
+    @staticmethod
+    def _lines(widget):
+        return [ln.strip() for ln in widget.get("1.0", "end").splitlines() if ln.strip()]
+
+    def _save(self):
+        cfg = json.loads(json.dumps(DEFAULT_SETTINGS))
+        cfg["detectors"] = {k: bool(v.get()) for k, v in self.det_vars.items()}
+        cfg["options"] = {k: bool(v.get()) for k, v in self.opt_vars.items()}
+        cfg["company_names"] = self._lines(self.txt_company)
+        cfg["extra_terms"] = self._lines(self.txt_terms)
+        cfg["allowlist"] = self._lines(self.txt_allow)
+
+        patterns, bad = [], []
+        for line in self._lines(self.txt_custom):
+            if "=" not in line:
+                bad.append(line)
+                continue
+            label, pat = line.split("=", 1)
+            label, pat = label.strip().upper() or "REDACTED", pat.strip()
+            try:
+                re.compile(pat)
+            except re.error as exc:
+                bad.append("%s  (%s)" % (line, exc))
+                continue
+            patterns.append({"label": label, "pattern": pat})
+        cfg["custom_patterns"] = patterns
+
+        if bad:
+            messagebox.showwarning(
+                "Some custom patterns were skipped",
+                "These lines aren't valid 'LABEL = regex' entries:\n\n" + "\n".join(bad),
+                parent=self)
+
+        ok, msg = save_settings(cfg)
+        if not ok:
+            messagebox.showerror("Settings", msg, parent=self)
+            return
+        self.on_save(cfg, msg)
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+class RedactorApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.cfg = load_settings()
+        self.title("%s %s" % (APP_NAME, APP_VERSION))
+        self.configure(bg=BG)
+        self.geometry("1150x880")
+        self.minsize(820, 600)
+
+        self._highlight_job = None
+        self._redact_job = None
+        self._spans = []
+        self._span_index = 0
+        self._nav_used = False
+
+        self._build_toolbar()
+        self._build_footer()   # packed to the bottom edge first
+        self._build_panes()
+
+        self.bind("<F3>", lambda e: self._goto_redaction(1))
+        self.bind("<Shift-F3>", lambda e: self._goto_redaction(-1))
+        self.bind("<Control-s>", lambda e: self.export_file())
+        self.bind("<Control-S>", lambda e: self.export_file())
+
+        self.input.focus_set()
+        self.set_status("Paste a PowerShell script above. %d detectors active." %
+                        sum(1 for v in self.cfg["detectors"].values() if v))
+
+    # -- layout --------------------------------------------------------------
+    def _build_toolbar(self):
+        bar = tk.Frame(self, bg=BG_PANEL, highlightthickness=0)
+        bar.pack(fill="x", side="top")
+        inner = tk.Frame(bar, bg=BG_PANEL)
+        inner.pack(fill="x", padx=12, pady=8)
+
+        tk.Label(inner, text="PowerShell Redactor", bg=BG_PANEL, fg=FG,
+                 font=(UI_FONT[0], UI_FONT[1] + 3, "bold")).pack(side="left")
+
+        make_button(inner, "Settings", self.open_settings).pack(side="right")
+        make_button(inner, "Clear", self.clear_input).pack(side="right", padx=8)
+        make_button(inner, "Open file…", self.open_file).pack(side="right")
+
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+
+    def _build_panes(self):
+        self.panes = tk.PanedWindow(self, orient="vertical", bg=BG, sashwidth=6,
+                                    sashrelief="flat", bd=0, showhandle=False)
+        self.panes.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # ---- input ----
+        top = tk.Frame(self.panes, bg=BG)
+        tk.Label(top, text="Script", bg=BG, fg=FG_DIM, font=UI_FONT,
+                 anchor="w").pack(fill="x", pady=(0, 4))
+        self.in_wrap = wrap = tk.Frame(top, bg=BORDER, highlightthickness=0)
+        wrap.pack(fill="both", expand=True)
+
+        self.gutter = tk.Text(wrap, width=5, bg=GUTTER_BG, fg=GUTTER_FG, bd=0,
+                              relief="flat", font=MONO, padx=6, pady=6,
+                              highlightthickness=0, takefocus=0, cursor="arrow",
+                              state="disabled", wrap="none")
+        self.gutter.pack(side="left", fill="y", padx=(1, 0), pady=1)
+
+        self.input = tk.Text(wrap, bg=BG_INPUT, fg=FG, insertbackground="#ffffff",
+                             selectbackground=SEL_BG, relief="flat", bd=0,
+                             font=MONO, padx=8, pady=6, wrap="none",
+                             highlightthickness=0, undo=True, tabs="    ")
+        self.input.pack(side="left", fill="both", expand=True, pady=1)
+
+        self.in_scroll = make_scrollbar(wrap, self._scroll_input)
+        self.in_scroll.pack(side="right", fill="y", padx=(0, 1), pady=1)
+
+        self.input.configure(yscrollcommand=self._on_input_scroll)
+
+        xscroll = make_scrollbar(top, self.input.xview)
+        xscroll.configure(orient="horizontal", width=12)
+        xscroll.pack(fill="x")
+        self.input.configure(xscrollcommand=xscroll.set)
+
+        for tag, color in SYNTAX.items():
+            self.input.tag_configure(tag, foreground=color)
+        self.input.tag_configure("comment", foreground=SYNTAX["comment"])
+
+        self.input.bind("<<Modified>>", self._on_modified)
+        self.input.bind("<MouseWheel>", lambda e: self.after(1, self._sync_gutter))
+        self.input.bind("<Button-4>", lambda e: self.after(1, self._sync_gutter))
+        self.input.bind("<Button-5>", lambda e: self.after(1, self._sync_gutter))
+
+        self.panes.add(top, stretch="always", minsize=140)
+
+        # ---- output ----
+        bottom = tk.Frame(self.panes, bg=BG)
+        head = tk.Frame(bottom, bg=BG)
+        head.pack(fill="x", pady=(0, 4))
+        tk.Label(head, text="Redacted", bg=BG, fg=FG_DIM, font=UI_FONT).pack(side="left")
+        self.count_label = tk.Label(head, text="", bg=BG, fg=REDACT_BG,
+                                    font=(UI_FONT[0], UI_FONT[1], "bold"))
+        self.count_label.pack(side="left", padx=10)
+
+        nav = tk.Frame(head, bg=BG)
+        nav.pack(side="left")
+
+        def nav_button(glyph, cmd):
+            b = tk.Button(nav, text=glyph, command=cmd, bg=BG, fg=FG_DIM,
+                          activebackground=BG_BUTTON, activeforeground="#ffffff",
+                          relief="flat", bd=0, padx=6, pady=0, font=UI_FONT,
+                          cursor="hand2", highlightthickness=0,
+                          disabledforeground=BORDER)
+            b.pack(side="left")
+            return b
+
+        self.prev_btn = nav_button("\u25b2", lambda: self._goto_redaction(-1))
+        self.next_btn = nav_button("\u25bc", lambda: self._goto_redaction(1))
+        self.pos_label = tk.Label(nav, text="", bg=BG, fg=FG_DIM, font=UI_FONT)
+        self.pos_label.pack(side="left", padx=(6, 0))
+
+        # buttons and scrollbar are packed against the bottom edge first, so the
+        # output box gives up space instead of the buttons being clipped
+        btns = tk.Frame(bottom, bg=BG)
+        btns.pack(side="bottom", fill="x", pady=(10, 0))
+        btns.columnconfigure(0, weight=1, uniform="b")
+        btns.columnconfigure(1, weight=1, uniform="b")
+        make_button(btns, "Copy redacted text", self.copy_output).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6), ipady=3)
+        make_button(btns, "Export to file…", self.export_file, accent=True).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0), ipady=3)
+
+        oxsb = make_scrollbar(bottom, lambda *a: self.output.xview(*a))
+        oxsb.configure(orient="horizontal", width=12)
+        oxsb.pack(side="bottom", fill="x")
+
+        owrap = tk.Frame(bottom, bg=BORDER)
+        owrap.pack(side="top", fill="both", expand=True)
+        self.output = tk.Text(owrap, bg=BG_INPUT, fg=FG, relief="flat", bd=0,
+                              font=MONO, padx=8, pady=6, wrap="none",
+                              highlightthickness=0, insertbackground=BG_INPUT,
+                              selectbackground=SEL_BG)
+        self.output.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
+        osb = make_scrollbar(owrap, self.output.yview)
+        osb.pack(side="right", fill="y", padx=(0, 1), pady=1)
+        self.output.configure(yscrollcommand=osb.set)
+        self.output.configure(xscrollcommand=oxsb.set)
+        for tag, color in SYNTAX.items():
+            self.output.tag_configure(tag, foreground=color)
+        self.output.tag_configure("redact", background=REDACT_BG, foreground=REDACT_FG,
+                                  font=(MONO[0], MONO[1], "bold"))
+        self.output.tag_raise("redact")   # always wins over the syntax colours
+        self.output.configure(state="disabled")
+
+        self.panes.add(bottom, stretch="always", minsize=210)
+
+    def _build_footer(self):
+        self.status = tk.Label(self, text="", bg=BG_PANEL, fg=FG_DIM, anchor="w",
+                               font=UI_FONT, padx=12, pady=5)
+        self.status.pack(fill="x", side="bottom")
+
+    # -- gutter / scroll sync ------------------------------------------------
+    def _scroll_input(self, *args):
+        self.input.yview(*args)
+        self._sync_gutter()
+
+    def _on_input_scroll(self, first, last):
+        self.in_scroll.set(first, last)
+        self.gutter.yview_moveto(first)
+
+    def _sync_gutter(self):
+        first, _ = self.input.yview()
+        self.gutter.yview_moveto(first)
+
+    def _update_gutter(self):
+        lines = int(self.input.index("end-1c").split(".")[0])
+        content = "\n".join(str(i).rjust(4) for i in range(1, lines + 1))
+        self.gutter.configure(state="normal")
+        self.gutter.delete("1.0", "end")
+        self.gutter.insert("1.0", content)
+        self.gutter.configure(state="disabled")
+        self._sync_gutter()
+
+    # -- events --------------------------------------------------------------
+    def _on_modified(self, event=None):
+        if not self.input.edit_modified():
+            return
+        self.input.edit_modified(False)
+        self._update_gutter()
+        if self.cfg["options"].get("syntax_highlight", True):
+            if self._highlight_job:
+                self.after_cancel(self._highlight_job)
+            self._highlight_job = self.after(180, self.highlight_input)
+        if self._redact_job:
+            self.after_cancel(self._redact_job)
+        self._redact_job = self.after(320, self.run_redaction)
+
+    def highlight_input(self):
+        self._highlight_job = None
+        text = self.input.get("1.0", "end-1c")
+        for tag in SYNTAX:
+            self.input.tag_remove(tag, "1.0", "end")
+        if not text or len(text) > 400000:
+            return
+        for start, end, tag in tokenize_powershell(text):
+            self.input.tag_add(tag,
+                               "1.0+%dc" % start,
+                               "1.0+%dc" % end)
+
+    def run_redaction(self):
+        self._redact_job = None
+        text = self.input.get("1.0", "end-1c")
+        segments, counts = redact(text, self.cfg)
+
+        out_parts, spans, pos = [], [], 0
+        for kind, chunk in segments:
+            out_parts.append(chunk)
+            if kind == "redact":
+                spans.append((pos, pos + len(chunk)))
+            pos += len(chunk)
+        out_text = "".join(out_parts)
+
+        self.output.configure(state="normal")
+        self.output.delete("1.0", "end")
+        for tag in SYNTAX:
+            self.output.tag_remove(tag, "1.0", "end")
+        self.output.insert("1.0", out_text)
+
+        if self.cfg["options"].get("syntax_highlight", True) and len(out_text) <= 400000:
+            for a, b, tag in tokenize_powershell(out_text):
+                self.output.tag_add(tag, "1.0+%dc" % a, "1.0+%dc" % b)
+        for a, b in spans:
+            self.output.tag_add("redact", "1.0+%dc" % a, "1.0+%dc" % b)
+        self.output.tag_raise("redact")
+        self.output.configure(state="disabled")
+
+        # navigation always starts on redaction #1
+        self._spans = spans
+        self._span_index = 0
+        self._nav_used = False
+        if spans:
+            a, b = spans[0]
+            self.prev_btn.configure(state="normal")
+            self.next_btn.configure(state="normal")
+            self.pos_label.configure(text="1 / %d" % len(spans))
+            self.output.see("1.0+%dc+3l" % b)
+            self.output.see("1.0+%dc" % a)
+        else:
+            self.prev_btn.configure(state="disabled")
+            self.next_btn.configure(state="disabled")
+            self.pos_label.configure(text="")
+
+        total = sum(counts.values())
+        self.count_label.configure(
+            text="%d redaction%s" % (total, "" if total == 1 else "s") if total else "")
+        if total:
+            breakdown = ", ".join("%d x %s" % (n, lab)
+                                  for lab, n in counts.most_common(8))
+            extra = "" if len(counts) <= 8 else ", …"
+            self.set_status(breakdown + extra)
+        else:
+            self.set_status("Nothing matched." if text.strip()
+                            else "Paste a PowerShell script above.")
+
+    def _update_nav(self):
+        total = len(self._spans)
+        state = "normal" if total else "disabled"
+        self.prev_btn.configure(state=state)
+        self.next_btn.configure(state=state)
+        if not total:
+            self.pos_label.configure(text="")
+        else:
+            self.pos_label.configure(text="%d / %d" % (self._span_index + 1, total))
+
+    def _goto_redaction(self, step):
+        if not self._spans:
+            return
+        if not self._nav_used:
+            # first press just scrolls to #1, which is already selected
+            self._nav_used = True
+            if step < 0:
+                self._span_index = len(self._spans) - 1
+        else:
+            self._span_index = (self._span_index + step) % len(self._spans)
+        a, b = self._spans[self._span_index]
+        start, end = "1.0+%dc" % a, "1.0+%dc" % b
+        self.output.see("%s+3l" % end)
+        self.output.see(start)
+        self._update_nav()
+
+    def set_status(self, msg):
+        self.status.configure(text=msg)
+
+    # -- actions -------------------------------------------------------------
+    def clear_input(self):
+        self.input.delete("1.0", "end")
+        self.input.edit_modified(True)
+        self._on_modified()
+
+    def open_file(self):
+        path = filedialog.askopenfilename(
+            title="Open script",
+            filetypes=[("PowerShell", "*.ps1 *.psm1 *.psd1"),
+                       ("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+                data = fh.read()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, "Could not open file:\n%s" % exc)
+            return
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", data)
+        self.input.edit_modified(True)
+        self._on_modified()
+        self.set_status("Loaded %s" % os.path.basename(path))
+
+    def copy_output(self):
+        text = self.output.get("1.0", "end-1c")
+        if not text.strip():
+            self.set_status("Nothing to copy yet.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+        self.set_status("Redacted text copied to clipboard.")
+
+    def export_file(self):
+        text = self.output.get("1.0", "end-1c")
+        if not text.strip():
+            self.set_status("Nothing to export yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export redacted script", defaultextension=".ps1",
+            initialfile="redacted.ps1",
+            filetypes=[("PowerShell", "*.ps1"), ("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="\r\n") as fh:
+                fh.write(text)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, "Could not save file:\n%s" % exc)
+            return
+        self.set_status("Exported to %s" % path)
+
+    def open_settings(self):
+        SettingsWindow(self, self.cfg, self._settings_saved)
+
+    def _settings_saved(self, cfg, msg):
+        self.cfg = cfg
+        self.run_redaction()
+        if not self.cfg["options"].get("syntax_highlight", True):
+            for tag in SYNTAX:
+                self.input.tag_remove(tag, "1.0", "end")
+        else:
+            self.highlight_input()
+        self.set_status(msg)
+
+
+def main():
+    app = RedactorApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
