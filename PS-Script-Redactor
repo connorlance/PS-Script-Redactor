@@ -37,7 +37,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 APP_NAME = "PowerShell Redactor"
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 
 # ---------------------------------------------------------------------------
 # Persisted settings live in the block below. It is rewritten in place when you
@@ -114,6 +114,10 @@ EMBEDDED_SETTINGS = r'''
     "example.com"
   ],
   "custom_patterns": [],
+  "geometry": {
+    "main": "820x600",
+    "settings": "900x1120"
+  },
   "options": {
     "number_placeholders": true,
     "redact_private_ips": true,
@@ -404,6 +408,10 @@ DEFAULT_SETTINGS = {
     "extra_terms": [],
     "allowlist": list(DEFAULT_ALLOWLIST),
     "custom_patterns": [],          # [{"label": "EMPLOYEE ID", "pattern": "EMP\\d{6}"}]
+    "geometry": {                   # window sizes, remembered between runs
+        "main": "1150x880",
+        "settings": "900x1120",
+    },
     "options": {
         "number_placeholders": True,     # only when a label has >1 distinct value
         "redact_private_ips": True,      # 10.x, 192.168.x, 172.16-31.x
@@ -430,6 +438,26 @@ def _sidecar_path():
     base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
                                            else (_script_path() or sys.argv[0])))
     return os.path.join(base, "ps_redactor.settings.json")
+
+
+_SIZE_RE = re.compile(r"^\d{3,5}x\d{3,5}$")
+
+
+def _size_of(window):
+    return "%dx%d" % (window.winfo_width(), window.winfo_height())
+
+
+def apply_size(window, wanted, fallback):
+    """Set a window size, clamped to what actually fits on this screen."""
+    if not _SIZE_RE.match(wanted or ""):
+        wanted = fallback
+    try:
+        w, h = (int(n) for n in wanted.split("x"))
+    except ValueError:
+        w, h = (int(n) for n in fallback.split("x"))
+    w = min(w, window.winfo_screenwidth() - 40)
+    h = min(h, window.winfo_screenheight() - 80)
+    window.geometry("%dx%d" % (w, h))
 
 
 def _merge(defaults, loaded):
@@ -859,9 +887,11 @@ class SettingsWindow(tk.Toplevel):
         super().__init__(master)
         self.title("Settings")
         self.configure(bg=BG)
-        self.geometry("1000x740")
-        self.minsize(620, 380)
         self.cfg = json.loads(json.dumps(cfg))
+        self.app = master
+        apply_size(self, self.cfg.get("geometry", {}).get("settings"),
+                   DEFAULT_SETTINGS["geometry"]["settings"])
+        self.minsize(620, 380)
         self.on_save = on_save
         self.transient(master)
         self.grab_set()
@@ -879,7 +909,7 @@ class SettingsWindow(tk.Toplevel):
         fbar.pack(fill="x", padx=14, pady=10)
         make_button(fbar, "Restore defaults", self._restore).pack(side="left")
         make_button(fbar, "Save settings", self._save, accent=True).pack(side="right")
-        make_button(fbar, "Cancel", self.destroy).pack(side="right", padx=8)
+        make_button(fbar, "Cancel", self._close).pack(side="right", padx=8)
 
         body = tk.Frame(self, bg=BG)
         body.pack(side="top", fill="both", expand=True, padx=14, pady=14)
@@ -890,8 +920,20 @@ class SettingsWindow(tk.Toplevel):
         self._build_detector_panel(body)
         self._build_lists_panel(body)
 
-        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Escape>", lambda e: self._close())
+        self.protocol("WM_DELETE_WINDOW", self._close)
         self._load_into_widgets(self.cfg)
+
+    def _remember_size(self):
+        """Hand this window's size back to the app so it is saved with the rest."""
+        try:
+            self.app.cfg.setdefault("geometry", {})["settings"] = _size_of(self)
+        except Exception:
+            pass
+
+    def _close(self):
+        self._remember_size()
+        self.destroy()
 
     # -- reusable scrollable area -------------------------------------------
     def _make_scroller(self, parent, bg):
@@ -1047,7 +1089,10 @@ class SettingsWindow(tk.Toplevel):
         return [ln.strip() for ln in widget.get("1.0", "end").splitlines() if ln.strip()]
 
     def _save(self):
+        self._remember_size()
         cfg = json.loads(json.dumps(DEFAULT_SETTINGS))
+        cfg["geometry"] = dict(self.app.cfg.get("geometry",
+                                                DEFAULT_SETTINGS["geometry"]))
         cfg["detectors"] = {k: bool(v.get()) for k, v in self.det_vars.items()}
         cfg["options"] = {k: bool(v.get()) for k, v in self.opt_vars.items()}
         cfg["company_names"] = self._lines(self.txt_company)
@@ -1092,8 +1137,10 @@ class RedactorApp(tk.Tk):
         self.cfg = load_settings()
         self.title("%s %s" % (APP_NAME, APP_VERSION))
         self.configure(bg=BG)
-        self.geometry("1150x880")
+        apply_size(self, self.cfg.get("geometry", {}).get("main"),
+                   DEFAULT_SETTINGS["geometry"]["main"])
         self.minsize(820, 600)
+        self.protocol("WM_DELETE_WINDOW", self._on_exit)
 
         self._highlight_job = None
         self._redact_job = None
@@ -1426,6 +1473,16 @@ class RedactorApp(tk.Tk):
             messagebox.showerror(APP_NAME, "Could not save file:\n%s" % exc)
             return
         self.set_status("Exported to %s" % path)
+
+    def _on_exit(self):
+        """Remember both window sizes on the way out, writing only if changed."""
+        geo = self.cfg.setdefault("geometry", dict(DEFAULT_SETTINGS["geometry"]))
+        before = dict(geo)
+        geo["main"] = _size_of(self)
+        geo.setdefault("settings", DEFAULT_SETTINGS["geometry"]["settings"])
+        if geo != before:
+            save_settings(self.cfg)
+        self.destroy()
 
     def open_settings(self):
         SettingsWindow(self, self.cfg, self._settings_saved)
