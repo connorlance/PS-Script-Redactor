@@ -3,7 +3,7 @@ Python GUI tool to redact PowerShell scripts.
 
 Paste or open a script, and a redacted copy appears below it with every replacement highlighted. 37 detectors cover secrets, tenant IDs, accounts, hostnames and paths; you add your own company names and terms on top.
 
-![Main window](screenshots/main-window.png)
+![Main window](screenshots/main-window.PNG)
 
 ---
 
@@ -29,7 +29,7 @@ The whole tool is one file. Copy it wherever you like.
 3. Walk the ▲ ▼ arrows next to the redaction count to review every replacement, one at a time. `F3` and `Shift+F3` do the same.
 4. **Copy redacted text** or **Export to file…** (`Ctrl+S`).
 
-![Redaction navigation](screenshots/navigation.png)
+![Redaction navigation](screenshots/navigation.PNG)
 
 ### Placeholders
 
@@ -53,7 +53,7 @@ Matching is case-insensitive, so `Alice@corp.com` and `alice@corp.com` count as 
 
 ## Settings
 
-![Settings](screenshots/settings.png)
+![Settings](screenshots/settings.PNG)
 
 ### Company names and terms
 
@@ -180,7 +180,7 @@ For when you'd rather destroy a readable script than risk a miss.
 
 The comments one is the highest-value of these for real scripts. Comments are where server names, ticket numbers and colleagues' names sit in prose that no structural pattern will ever catch.
 
-![Aggressive mode](screenshots/aggressive.png)
+![Aggressive mode](screenshots/aggressive.PNG)
 
 ## Where settings are stored
 
