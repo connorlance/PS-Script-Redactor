@@ -179,7 +179,7 @@ For when you'd rather destroy a readable script than risk a miss.
 
 The comments one is the highest-value of these for real scripts. Comments are where server names, ticket numbers and colleagues' names sit in prose that no structural pattern will ever catch.
 
-![Aggressive mode](screenshots/aggressive.PNG)
+![Aggressive mode](screenshots/aggressive.png)
 
 ## Where settings are stored
 
