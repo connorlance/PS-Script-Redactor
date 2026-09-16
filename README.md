@@ -27,9 +27,8 @@ The whole tool is one file. Copy it wherever you like.
 1. **Open file…** to load a `.ps1`, or click into the top box and paste.
 2. The redacted version builds itself in the lower box about a third of a second after you stop typing.
 3. Walk the ▲ ▼ arrows next to the redaction count to review every replacement, one at a time. `F3` and `Shift+F3` do the same.
-4. **Copy redacted text** or **Export to file…** (`Ctrl+S`).
-
 ![Redaction navigation](screenshots/navigation.PNG)
+4. **Copy redacted text** or **Export to file…** (`Ctrl+S`).
 
 ### Placeholders
 
